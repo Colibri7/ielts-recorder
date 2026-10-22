@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Crect width=%2724%27 height=%2724%27 rx=%276%27 fill=%27%236260c4%27/%3E%3Cpath d=%27M12 5a2.5 2.5 0 0 0-2.5 2.5v4.5a2.5 2.5 0 0 0 5 0V7.5A2.5 2.5 0 0 0 12 5z%27 fill=%27white%27/%3E%3Cpath d=%27M17 11.5a5 5 0 0 1-10 0M12 16.5V19%27 stroke=%27white%27 stroke-width=%271.6%27 fill=%27none%27 stroke-linecap=%27round%27/%3E%3C/svg%3E">
+<title>Speaking · Recorder</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --accent: rgb(98 96 196); --bad: #d70015; --ok: #248a3d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --muted: #98989d; --accent: rgb(100 98 214); --bad: #ff453a; --ok: #30d158; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+  main { width: min(380px, 100%); padding: 26px 20px 24px; border-radius: 20px; background: var(--card); text-align: center; box-shadow: 0 10px 30px rgba(0, 0, 0, .08); }
+  h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  p { margin: 0; color: var(--muted); font-size: 15px; }
+  .clock { margin: 22px 0 6px; font-size: 46px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .state { min-height: 44px; margin-bottom: 14px; font-size: 15px; color: var(--muted); }
+  .rec .clock, .rec .state { color: var(--bad); }
+  .done .state { color: var(--ok); font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; background: var(--bad); vertical-align: 1px; animation: blink 1s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  button { min-width: 170px; padding: 14px 24px; border: 0; border-radius: 980px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<main id="box">
+  <h1 id="title">Speaking</h1>
+  <p id="hint">Press Start and answer aloud. When you stop, the recording goes back to the test.</p>
+  <div class="clock" id="clock">0:00</div>
+  <div class="state" id="state" role="status"></div>
+  <button type="button" id="go">Start</button>
+</main>
+<script>
+// A recorder for the IELTS practice site. A browser gives the microphone to an https page only, and the site runs on
+// plain http: the test page opens this window, the recording goes back to it with postMessage, the site saves it.
+// Nothing is sent anywhere else, and the page keeps nothing.
+(() => {
+  const q = new URLSearchParams(location.search);
+  const part = Math.max(0, Math.min(3, Number(q.get('part')) || 0));
+  const cap = Math.max(10, Math.min(20 * 60, Number(q.get('cap')) || 15 * 60)); // seconds; then it stops by itself
+  const down = q.get('down') === '1'; // Part 2: the clock counts down its two minutes
+  let origin = '';
+  try { origin = new URL(q.get('o') || '').origin; } catch { /* no page to send to */ }
+  const $ = (id) => document.getElementById(id);
+  const box = $('box');
+  const clock = $('clock');
+  const state = $('state');
+  const go = $('go');
+  const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  const title = part ? `Speaking · Part ${part}` : 'Speaking';
+  $('title').textContent = title;
+  document.title = `${title} · Recorder`;
+  clock.textContent = down ? fmt(cap) : '0:00';
+  const opener = window.opener;
+  if (!opener || !origin) {
+    $('hint').textContent = 'Open this window with Record on the Speaking page of the test.';
+    go.hidden = true;
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    $('hint').textContent = 'This browser cannot record. Open the test in Chrome, Safari or Firefox.';
+    go.hidden = true;
+    return;
+  }
+  let stream = null;
+  let recorder = null;
+  let chunks = [];
+  let started = 0;
+  let timer = 0;
+  let phase = 'idle';
+  const say = (text) => { state.textContent = text; };
+  const tell = (msg) => { try { opener.postMessage({ source: 'ielts-recorder', part, ...msg }, origin); } catch { /* the test page is gone */ } };
+  // the format the browser can make: AAC in Safari, Opus in webm elsewhere; a bare audio/mp4 in Chrome would be Opus in mp4
+  const mimeOf = () => ['audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/mp4']
+    .find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const extOf = (type) => (/mp4/.test(type) ? '.m4a' : /ogg/.test(type) ? '.ogg' : '.webm');
+
+  async function start() {
+    go.disabled = true;
+    say('Starting the microphone… allow it if the browser asks.');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      go.disabled = false;
+      say(err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')
+        ? 'The microphone is blocked. Allow it for this page in the browser, then press Start.' : 'No microphone found.');
+      return;
+    }
+    const type = mimeOf();
+    try {
+      recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    } catch {
+      recorder = new MediaRecorder(stream);
+    }
+    chunks = [];
+    recorder.addEventListener('dataavailable', (e) => { if (e.data.size) chunks.push(e.data); });
+    recorder.addEventListener('stop', finish);
+    recorder.start(1000);
+    started = Date.now();
+    phase = 'rec';
+    box.className = 'rec';
+    go.textContent = 'Stop';
+    go.disabled = false;
+    state.innerHTML = '<span class="dot"></span>Recording — speak now';
+    tell({ type: 'recording' });
+    timer = setInterval(tick, 250);
+  }
+  function tick() {
+    const sec = Math.floor((Date.now() - started) / 1000);
+    clock.textContent = fmt(down ? Math.max(0, cap - sec) : sec);
+    if (sec >= cap) stop();
+  }
+  function stop() {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  }
+  function finish() {
+    clearInterval(timer);
+    stream.getTracks().forEach((t) => t.stop());
+    const type = recorder.mimeType || mimeOf() || 'audio/webm';
+    const blob = new Blob(chunks, { type });
+    box.className = '';
+    if (blob.size < 1000) {
+      phase = 'idle';
+      go.textContent = 'Start';
+      go.disabled = false;
+      say('Nothing was recorded. Try again.');
+      return;
+    }
+    phase = 'sending';
+    go.disabled = true;
+    say('Sending to the test…');
+    const d = new Date();
+    const name = `${part ? `Part ${part} ` : ''}${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${extOf(type)}`;
+    tell({ type: 'recorded', blob, mime: type, name });
+    setTimeout(() => {
+      if (phase !== 'sending') return;
+      phase = 'idle';
+      go.textContent = 'Record again';
+      go.disabled = false;
+      say('The test page did not answer. Keep it open and try again.');
+    }, 15000);
+  }
+  window.addEventListener('message', (e) => {
+    if (e.origin !== origin || !e.data || e.data.source !== 'ielts-site' || phase !== 'sending') return;
+    if (e.data.type === 'saved') {
+      phase = 'done';
+      box.className = 'done';
+      say('Saved. This window closes now.');
+      go.hidden = true;
+      setTimeout(() => window.close(), 1200);
+    } else if (e.data.type === 'failed') {
+      phase = 'idle';
+      go.textContent = 'Record again';
+      go.disabled = false;
+      say(e.data.message || 'Not saved. Try again.');
+    }
+  });
+  go.addEventListener('click', () => (phase === 'rec' ? stop() : start()));
+  window.addEventListener('pagehide', () => { if (phase === 'rec') stop(); });
+  tell({ type: 'ready' });
+})();
+</script>
+</body>
+</html>
